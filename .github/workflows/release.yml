@@ -1,0 +1,69 @@
+name: Release
+
+# Uma tag vX.Y.Z constrói UMA vez as imagens versionadas, varre vulnerabilidades e publica no GHCR.
+# O deploy (deploy.yml) promove essas MESMAS imagens (por tag/digest) de staging para produção, sem reconstruir.
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  images:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      matrix:
+        include:
+          - { name: web, context: ., target: web }
+          - { name: worker, context: ., target: worker }
+          - { name: realtime, context: ./realtime, target: '' }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with: { registry: ghcr.io, username: '${{ github.actor }}', password: '${{ secrets.GITHUB_TOKEN }}' }
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/cuepoint-${{ matrix.name }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=sha
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          target: ${{ matrix.target }}
+          push: false
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+      - name: Varredura antes de publicar
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+      - name: Publica (mesma imagem que foi varrida)
+        run: |
+          for t in $(echo '${{ steps.meta.outputs.tags }}'); do docker push "$t"; done
+
+  notes:
+    needs: images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          body: |
+            Imagens: `ghcr.io/${{ github.repository_owner }}/cuepoint-{web,worker,realtime}:${{ github.ref_name }}`.
+            Promoção: rode o workflow **Deploy** com esta tag em `staging` e, após o teste de fumaça, em `production`.
+            Rollback: rode **Deploy** com a tag anterior (migrações são compatíveis; ver docs/release.md).

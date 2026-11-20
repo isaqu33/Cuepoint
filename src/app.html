@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<!-- <html lang="en" class="dark"> -->
+<html lang="pt-BR">
+	<head>
+		<meta charset="utf-8" />
+		<link rel="icon" type="image/svg+xml" href="%sveltekit.assets%/favicon.svg" />
+		<meta name="theme-color" content="#3366F0" />
+		<script>
+			// Aplica o tema antes da primeira pintura (sem "flash" claro).
+			try {
+				var m = localStorage.getItem('cuepoint-theme');
+				var dark = m === 'dark'; // claro é o padrão; só vai ao escuro por escolha salva
+				document.documentElement.classList.toggle('dark', dark);
+			} catch (e) {}
+		</script>
+		<meta name="description" content="Cuepoint — biblioteca de mídia com processamento automatizado." />
+		<title>Cuepoint</title>
+		<meta name="viewport" content="width=device-width" />
+    <link rel="stylesheet" href="https://cdn.plyr.io/3.7.8/plyr.css">
+		%sveltekit.head%
+	</head>
+	<body data-sveltekit-preload-data="hover" data-theme="cuepoint">
+		<div style="display: contents" class="h-full overflow-hidden max-w-sm">%sveltekit.body%</div>
+    <script src="https://cdn.plyr.io/3.7.8/plyr.js"></script>
+
+	</body>
+</html>

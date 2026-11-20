@@ -1,0 +1,25 @@
+# top-most EditorConfig file
+root = true
+
+# Unix-style newlines with a newline ending every file
+[*]
+end_of_line = lf
+insert_final_newline = true
+indent_style = space
+indent_size = 2
+
+# Matches multiple files with brace expansion notation
+# Set default charset
+[*.{js,html,css,styl,json,cpp,h,ts,prisma,svelte}]
+charset = utf-8
+
+# 2 space indentation
+[*.{js,css,styl,json,svelte}]
+indent_style = space
+indent_size = 2
+
+# 4 space indentation
+[*.{html,cpp,h,svelte}]
+indent_style = space
+indent_size = 2
+

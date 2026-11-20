@@ -1,0 +1,133 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Lint, tipos, testes unitários e de integração (Postgres e Redis reais) e build.
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env: { POSTGRES_USER: cuepoint, POSTGRES_PASSWORD: cuepoint, POSTGRES_DB: cuepoint }
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U cuepoint" --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      APP_DATABASE_URL: postgresql://cuepoint:cuepoint@localhost:5432/cuepoint?schema=public
+      APP_REDIS_HOST: localhost
+      APP_REDIS_PORT: '6379'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+      - run: npm ci
+      - run: npx prisma generate
+      - name: Migrações aplicam do zero (e o schema não tem diferença para o banco)
+        run: |
+          npx prisma migrate deploy
+          npx prisma migrate diff --from-url "$APP_DATABASE_URL" --to-schema-datamodel prisma/schema.prisma --exit-code
+      - run: npm run lint
+      - run: npm run typecheck
+      - name: Testes unitários e de integração
+        run: npm run test:unit -- --run
+      - run: npm run build
+      - run: npm run build:worker
+
+  # Dependências com vulnerabilidade conhecida (produção). Falha em crítico; alto vira aviso no relatório.
+  dependencies:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+      - run: npm ci --ignore-scripts
+      - run: npm audit --omit=dev --audit-level=critical
+      - name: Relatório completo (não bloqueia)
+        run: npm audit --omit=dev || true
+
+  # Ponta a ponta: a stack inteira em Docker + Playwright.
+  e2e:
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - name: Sobe a stack (segredos aleatórios, descartáveis)
+        run: |
+          scripts/ci-env.sh
+          docker compose -f docker-compose.dev.yml up -d --build
+          for i in $(seq 1 60); do curl -fs http://localhost:3300/api/health && break; sleep 5; done
+          docker compose -f docker-compose.dev.yml exec -T web npx tsx prisma/seed-admin.ts
+          docker compose -f docker-compose.dev.yml exec -T web npx tsx prisma/seed-demo.ts
+      - name: E2E
+        run: |
+          set -a; . ./.env; set +a
+          E2E_BASE_URL=http://localhost:3300 E2E_PASSWORD="$APP_SYSTEM_USER_PASSWORD" npx playwright test
+      - name: Teste de caos (derruba o worker no meio de um job)
+        run: scripts/chaos-kill-worker.sh
+      - name: Backup e restauração em ambiente isolado
+        run: |
+          scripts/backup.sh ./backups
+          scripts/restore-check.sh
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: e2e-diagnostico
+          path: |
+            test-results/
+            playwright-report/
+          retention-days: 7
+      - name: Logs da stack em caso de falha
+        if: failure()
+        run: docker compose -f docker-compose.dev.yml logs --no-color --tail 200
+
+  # Imagens de produção: constrói e varre (vulnerabilidades altas/críticas com correção disponível bloqueiam).
+  images:
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      matrix:
+        include:
+          - { name: web, context: ., target: web }
+          - { name: worker, context: ., target: worker }
+          - { name: realtime, context: ./realtime, target: '' }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          target: ${{ matrix.target }}
+          load: true
+          tags: cuepoint-${{ matrix.name }}:ci
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+      - uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: cuepoint-${{ matrix.name }}:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+          vuln-type: os,library

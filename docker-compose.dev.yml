@@ -1,0 +1,174 @@
+# Desenvolvimento: web com hot reload (bind mount). Worker usa a imagem (rebuild: docker compose -f docker-compose.dev.yml up --build).
+name: cuepoint
+
+x-app-env: &app-env
+  NODE_ENV: ${NODE_ENV:-production}
+  ORIGIN: ${ORIGIN:-http://localhost:3300}
+  APP_DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}?schema=public
+  APP_REDIS_HOST: redis
+  APP_REDIS_PORT: "6379"
+  MINIO_ENDPOINT: minio
+  MINIO_PORT: "9000"
+  MINIO_USE_SSL: "false"
+  REALTIME_URL: http://realtime:3001
+
+services:
+  migrate:
+    container_name: cuepoint-migrate
+    build: { context: ., dockerfile: Dockerfile, target: development }
+    command: ["npx", "prisma", "migrate", "deploy"]
+    env_file: [.env]
+    environment: *app-env
+    depends_on:
+      db: { condition: service_healthy }
+    networks: [cuepoint-network]
+    restart: "no"
+
+  web:
+    container_name: cuepoint-web
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    env_file: [.env]
+    volumes:
+      - .:/workspace
+      - /workspace/node_modules
+      - /workspace/.svelte-kit
+      - ./backups:/backups:ro
+    environment:
+      <<: *app-env
+      NODE_ENV: development
+    ports:
+      - "${WEB_PORT_HOST:-3300}:3300"
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+      minio: { condition: service_started }
+    networks: [cuepoint-network]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3300/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: worker
+    env_file: [.env]
+    environment: *app-env
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+      minio: { condition: service_started }
+    volumes:
+      - cuepoint_worker_tmp:/app/uploads
+      - ./backups:/backups:ro
+    # Limites de recurso: o worker de mídia não pode derrubar o resto.
+    mem_limit: ${WORKER_MEM_LIMIT:-3g}
+    cpus: ${WORKER_CPUS:-2}
+    networks: [cuepoint-network]
+    restart: unless-stopped
+    stop_grace_period: 60s
+
+  # Assinantes de eventos (e-mail, métricas). Independente do worker: se cair, a transcrição continua.
+  events:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: worker
+    command: ["node", "dist-worker/subscribers.js"]
+    env_file: [.env]
+    environment: *app-env
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    networks: [cuepoint-network]
+    restart: unless-stopped
+    stop_grace_period: 15s
+
+  db:
+    image: postgres:16-alpine
+    container_name: cuepoint-db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "${POSTGRES_PORT_HOST:-5433}:5432"
+    volumes:
+      - cuepoint_postgres:/var/lib/postgresql/data
+    networks: [cuepoint-network]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    container_name: cuepoint-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT_HOST:-6380}:6379"
+    volumes:
+      - cuepoint_redis:/data
+    networks: [cuepoint-network]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: rustfs/rustfs:latest
+    container_name: cuepoint-minio
+    environment:
+      RUSTFS_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      RUSTFS_SECRET_KEY: ${MINIO_SECRET_KEY}
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
+      # CORS da API S3: o navegador envia o arquivo direto (URL pré-assinada). Em produção, liste só a origem do app.
+      RUSTFS_CORS_ALLOWED_ORIGINS: ${STORAGE_CORS_ORIGINS:-*}
+    ports:
+      - "${MINIO_PORT_HOST:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT_HOST:-9001}:9001"
+    volumes:
+      - cuepoint_minio:/data
+    networks: [cuepoint-network]
+    restart: unless-stopped
+
+  realtime:
+    container_name: cuepoint-realtime
+    build:
+      context: ./realtime
+    environment:
+      PORT: "3001"
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+      APP_REDIS_HOST: redis
+      APP_REDIS_PORT: "6379"
+    depends_on:
+      redis: { condition: service_healthy }
+    ports:
+      - "${REALTIME_PORT_HOST:-3301}:3001"
+    networks: [cuepoint-network]
+    restart: unless-stopped
+
+networks:
+  cuepoint-network:
+    name: cuepoint-network
+    driver: bridge
+
+volumes:
+  cuepoint_postgres:
+  cuepoint_redis:
+  cuepoint_minio:
+  cuepoint_worker_tmp:

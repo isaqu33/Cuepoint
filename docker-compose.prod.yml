@@ -1,0 +1,203 @@
+# Imagem de produção rodando local (não é deploy): docker compose -f docker-compose.prod.yml up --build
+name: cuepoint_prod
+
+x-app-env: &app-env
+  NODE_ENV: ${NODE_ENV:-production}
+  ORIGIN: ${ORIGIN:-http://localhost:3300}
+  APP_DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}?schema=public
+  APP_REDIS_HOST: redis
+  APP_REDIS_PORT: "6379"
+  MINIO_ENDPOINT: minio
+  MINIO_PORT: "9000"
+  MINIO_USE_SSL: "false"
+  REALTIME_URL: http://realtime:3001
+
+services:
+  migrate:
+    container_name: cuepoint-migrate-prod
+    image: ghcr.io/${CUEPOINT_OWNER:-local}/cuepoint-web:${CUEPOINT_TAG:-latest}
+    build: { context: ., dockerfile: Dockerfile, target: web }
+    command: ["npx", "prisma", "migrate", "deploy"]
+    env_file: [.env]
+    environment: *app-env
+    depends_on:
+      db: { condition: service_healthy }
+    networks: [cuepoint-network]
+    restart: "no"
+
+  web:
+    image: ghcr.io/${CUEPOINT_OWNER:-local}/cuepoint-web:${CUEPOINT_TAG:-latest}
+    container_name: cuepoint-web-prod
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: web
+    env_file: [.env]
+    environment:
+      <<: *app-env
+    ports:
+      - "${WEB_PORT_HOST:-3300}:3300"
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+      minio: { condition: service_started }
+    networks: [cuepoint-network]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3300/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  worker:
+    image: ghcr.io/${CUEPOINT_OWNER:-local}/cuepoint-worker:${CUEPOINT_TAG:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: worker
+    env_file: [.env]
+    environment: *app-env
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+      minio: { condition: service_started }
+    volumes:
+      - cuepoint_worker_tmp-prod:/app/uploads
+      - cuepoint_backups-prod:/backups:ro
+    # Limites de recurso: o worker de mídia não pode derrubar o resto.
+    mem_limit: ${WORKER_MEM_LIMIT:-3g}
+    cpus: ${WORKER_CPUS:-2}
+    networks: [cuepoint-network]
+    restart: unless-stopped
+    stop_grace_period: 60s
+
+  # Assinantes de eventos (e-mail, métricas). Independente do worker: se cair, a transcrição continua.
+  events:
+    image: ghcr.io/${CUEPOINT_OWNER:-local}/cuepoint-worker:${CUEPOINT_TAG:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: worker
+    command: ["node", "dist-worker/subscribers.js"]
+    env_file: [.env]
+    environment: *app-env
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    networks: [cuepoint-network]
+    restart: unless-stopped
+    stop_grace_period: 15s
+
+  db:
+    image: postgres:16-alpine
+    container_name: cuepoint-db-prod
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "${POSTGRES_PORT_HOST:-5433}:5432"
+    volumes:
+      - cuepoint_postgres-prod:/var/lib/postgresql/data
+    networks: [cuepoint-network]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    container_name: cuepoint-redis-prod
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT_HOST:-6380}:6379"
+    volumes:
+      - cuepoint_redis-prod:/data
+    networks: [cuepoint-network]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: rustfs/rustfs:latest
+    container_name: cuepoint-minio-prod
+    environment:
+      RUSTFS_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      RUSTFS_SECRET_KEY: ${MINIO_SECRET_KEY}
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
+    ports:
+      - "${MINIO_PORT_HOST:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT_HOST:-9001}:9001"
+    volumes:
+      - cuepoint_minio-prod:/data
+    networks: [cuepoint-network]
+    restart: unless-stopped
+
+  realtime:
+    image: ghcr.io/${CUEPOINT_OWNER:-local}/cuepoint-realtime:${CUEPOINT_TAG:-latest}
+    container_name: cuepoint-realtime-prod
+    build:
+      context: ./realtime
+    environment:
+      PORT: "3001"
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+      APP_REDIS_HOST: redis
+      APP_REDIS_PORT: "6379"
+    depends_on:
+      redis: { condition: service_healthy }
+    ports:
+      - "${REALTIME_PORT_HOST:-3301}:3001"
+    networks: [cuepoint-network]
+    restart: unless-stopped
+
+  # Backup diário do banco (pg_dump em formato custom) na hora BACKUP_AT (padrão 01:30, antes da rotina das 02:00,
+  # que verifica se o backup existe e está recente). Mantém os BACKUP_KEEP mais novos.
+  backup:
+    image: postgres:16-alpine
+    container_name: cuepoint-backup-prod
+    environment:
+      PGHOST: db
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB}
+      BACKUP_AT: ${BACKUP_AT:-01:30}
+      BACKUP_KEEP: ${BACKUP_KEEP:-14}
+    depends_on:
+      db: { condition: service_healthy }
+    volumes:
+      - cuepoint_backups-prod:/backups
+    networks: [cuepoint-network]
+    restart: unless-stopped
+    command:
+      - sh
+      - -c
+      - |
+        while true; do
+          now=$$(date +%s); target=$$(date -d "$$(date +%F) $$BACKUP_AT" +%s 2>/dev/null || echo $$((now+86400)))
+          [ "$$target" -le "$$now" ] && target=$$((target+86400))
+          sleep $$((target-now))
+          out=/backups/cuepoint-$$(date +%Y%m%d-%H%M%S).dump
+          if pg_dump -Fc > "$$out.partial" && [ -s "$$out.partial" ]; then mv "$$out.partial" "$$out"; echo "backup ok: $$out"; else rm -f "$$out.partial"; echo "backup FALHOU" >&2; fi
+          ls -1t /backups/cuepoint-*.dump 2>/dev/null | tail -n +$$((BACKUP_KEEP+1)) | xargs -r rm -f
+        done
+
+networks:
+  cuepoint-network:
+    name: cuepoint-network-prod
+    driver: bridge
+
+volumes:
+  cuepoint_postgres-prod:
+  cuepoint_redis-prod:
+  cuepoint_minio-prod:
+  cuepoint_worker_tmp-prod:
+  cuepoint_backups-prod:

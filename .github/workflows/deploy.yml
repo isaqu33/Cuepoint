@@ -1,0 +1,57 @@
+name: Deploy
+
+# Promove uma versão JÁ construída (release.yml) para um ambiente, sem reconstruir: a imagem que passou em staging é
+# a que vai para produção. Ordem: baixa a imagem → migra o banco (compatível) → sobe → teste de fumaça → se falhar,
+# volta para a versão anterior automaticamente.
+#
+# Requer, por ambiente (Settings → Environments): secrets SSH_HOST, SSH_USER, SSH_KEY e variáveis APP_URL, APP_DIR.
+# O host precisa de Docker, do repositório em APP_DIR (docker-compose.prod.yml + .env) e acesso de leitura ao GHCR.
+on:
+  workflow_dispatch:
+    inputs:
+      environment: { description: Ambiente, type: choice, options: [staging, production], required: true }
+      tag: { description: 'Tag da versão (ex.: 1.4.0)', type: string, required: true }
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepara a chave SSH
+        run: |
+          install -m 600 /dev/null key
+          echo "${{ secrets.SSH_KEY }}" > key
+          mkdir -p ~/.ssh && ssh-keyscan -H "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts
+      - name: Deploy com rollback automático
+        env:
+          TAG: ${{ inputs.tag }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          ssh -i key "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" bash -s <<EOF
+          set -euo pipefail
+          cd "${{ vars.APP_DIR }}"
+          PREV=\$(grep -E '^CUEPOINT_TAG=' .env | cut -d= -f2 || echo "")
+          setenvtag() { sed -i '/^CUEPOINT_TAG=/d' .env; echo "CUEPOINT_TAG=\$1" >> .env; }
+          export CUEPOINT_OWNER="$OWNER"
+          setenvtag "$TAG"
+          docker compose -f docker-compose.prod.yml pull web worker events realtime
+          # 1) Migração (expand/contract: compatível com a versão anterior, então o rollback não precisa desfazê-la)
+          docker compose -f docker-compose.prod.yml run --rm migrate
+          # 2) Sobe a versão nova
+          docker compose -f docker-compose.prod.yml up -d --remove-orphans
+          # 3) Teste de fumaça; se falhar, volta para a versão anterior
+          for i in \$(seq 1 30); do curl -fs "${{ vars.APP_URL }}/api/health" >/dev/null && break; sleep 5; done
+          if ! bash scripts/smoke.sh "${{ vars.APP_URL }}"; then
+            echo "Smoke falhou: voltando para \${PREV:-versão anterior}" >&2
+            if [ -n "\$PREV" ]; then setenvtag "\$PREV"; docker compose -f docker-compose.prod.yml up -d; fi
+            exit 1
+          fi
+          EOF
+      - name: Limpa a chave
+        if: always()
+        run: rm -f key
